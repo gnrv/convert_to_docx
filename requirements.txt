@@ -1,0 +1,6 @@
+# No third-party Python packages are required.
+# convert_to_docx.py uses only the Python standard library.
+#
+# External CLI dependencies (install separately):
+# - pandoc
+# - @mermaid-js/mermaid-cli (mmdc)
