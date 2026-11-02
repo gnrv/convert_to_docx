@@ -30,6 +30,20 @@ Python package requirements are listed in `requirements.txt`.
 
 ## Install
 
+### Quick start: everything in a project venv (no system installs)
+
+Pandoc comes from `pypandoc_binary`, and Node.js + Mermaid CLI are installed into the venv via `nodeenv`:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+nodeenv -p                                  # Node.js inside .venv
+npm install -g @mermaid-js/mermaid-cli      # mmdc inside .venv
+```
+
+After that, `source .venv/bin/activate` is all you need. To install the tools system-wide instead, follow the steps below.
+
 ### 1) Python dependencies
 
 ```bash
@@ -102,6 +116,15 @@ Use a Word style template (`reference.docx`):
 ```bash
 python convert_to_docx.py Architecture.md --template reference.docx
 ```
+
+Any existing Word document can serve as the template; its styles, headers, footers and page setup are used, its content is ignored. Pandoc styles the template lacks (Body Text, Compact, Table, …) are added, based on the template's Normal and Table Grid styles.
+
+### Document layout options
+
+- **Table of contents placement:** by default a TOC is inserted before the body. Put a line containing only `[TOC]` to place it there instead (e.g. after a cover page). Word fills it in when it asks to update fields on open.
+- **Custom cover page:** set `title-block: false` in the YAML front matter to suppress pandoc's title block (title, subtitle, author, date). The `title` is still written to the document properties, so template headers bound to the title show it. Write the cover in the body using template styles, e.g. `::: {custom-style="DocTitle"}`.
+- **Table style per table:** add an attribute-only caption after the table, e.g. `: {custom-style="TableNormal"}` for a borderless table.
+- **Images** are resolved relative to the Markdown file's folder.
 
 ## Output
 

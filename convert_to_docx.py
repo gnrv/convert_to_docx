@@ -19,7 +19,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 # Home directory for building search paths
 _HOME = Path.home()
@@ -53,6 +55,13 @@ def _find_tool(name: str) -> str:
     for candidate in _SEARCH_PATHS.get(name, []):
         if candidate.exists():
             return str(candidate)
+    if name == "pandoc":
+        # Bundled with `pip install pypandoc_binary`
+        try:
+            import pypandoc
+            return pypandoc.get_pandoc_path()
+        except (ImportError, OSError):
+            pass
     return ""
 
 
@@ -150,6 +159,106 @@ def process_markdown(md_text: str, work_dir: Path, tools: dict[str, str]) -> str
     return pattern.sub(replacer, md_text)
 
 
+# A line containing only [TOC] marks where the Word table of contents goes
+TOC_PLACEHOLDER = re.compile(r"^\[TOC\][ \t]*$", re.MULTILINE)
+
+TOC_OPENXML = """```{=openxml}
+<w:sdt>
+<w:sdtPr><w:docPartObj><w:docPartGallery w:val="Table of Contents"/><w:docPartUnique/></w:docPartObj></w:sdtPr>
+<w:sdtContent><w:p><w:r>
+<w:fldChar w:fldCharType="begin" w:dirty="true"/>
+<w:instrText xml:space="preserve"> TOC \\o "1-3" \\h \\z \\u </w:instrText>
+<w:fldChar w:fldCharType="separate"/><w:fldChar w:fldCharType="end"/>
+</w:r></w:p></w:sdtContent>
+</w:sdt>
+```"""
+
+
+def read_metadata(md_path: Path, tools: dict[str, str]) -> dict:
+    """Return the document's metadata as pandoc JSON AST."""
+    result = subprocess.run(
+        [tools["pandoc"], str(md_path), "--from", "markdown", "--to", "json"],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    if result.returncode != 0:
+        print(f"pandoc error: {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(result.stdout)["meta"]
+
+
+def stringify(node) -> str:
+    """Flatten a pandoc JSON AST node to plain text."""
+    if isinstance(node, list):
+        return "".join(stringify(n) for n in node)
+    if not isinstance(node, dict):
+        return ""
+    t, c = node.get("t"), node.get("c")
+    if t in ("Str", "MetaString"):
+        return c
+    if t in ("Space", "SoftBreak", "LineBreak"):
+        return " "
+    if t == "Quoted":
+        q = '"' if c[0]["t"] == "DoubleQuote" else "'"
+        return q + stringify(c[1]) + q
+    return stringify(c)
+
+
+# Pandoc styles that a custom template may lack, built on the template's own
+# styles so they inherit its look. Without them Word silently falls back to
+# Normal and LibreOffice renders them unpredictably.
+_PANDOC_STYLES = {
+    "BodyText": '<w:style w:type="paragraph" w:styleId="BodyText"><w:name w:val="Body Text"/>'
+                '<w:basedOn w:val="Normal"/><w:qFormat/></w:style>',
+    "FirstParagraph": '<w:style w:type="paragraph" w:styleId="FirstParagraph"><w:name w:val="First Paragraph"/>'
+                      '<w:basedOn w:val="BodyText"/><w:next w:val="BodyText"/><w:qFormat/></w:style>',
+    # Tight list items: no extra space between items, like List Paragraph
+    "Compact": '<w:style w:type="paragraph" w:styleId="Compact"><w:name w:val="Compact"/>'
+               '<w:basedOn w:val="BodyText"/><w:qFormat/><w:pPr><w:contextualSpacing/></w:pPr></w:style>',
+    "VerbatimChar": '<w:style w:type="character" w:customStyle="1" w:styleId="VerbatimChar">'
+                    '<w:name w:val="Verbatim Char"/><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas"/><w:sz w:val="20"/></w:rPr></w:style>',
+    "Table": '<w:style w:type="table" w:styleId="Table"><w:name w:val="Table"/>'
+             '<w:basedOn w:val="TableGrid"/></w:style>',
+}
+
+
+def _add_missing_styles(styles_xml: bytes, document_xml: bytes) -> bytes:
+    """Define styles referenced by the document but absent from the template."""
+    defined = set(re.findall(rb'w:styleId="([^"]+)"', styles_xml))
+    used = set(re.findall(rb'<w:(?:pStyle|rStyle|tblStyle) w:val="([^"]+)"', document_xml))
+    additions = []
+    for style_id in sorted(used - defined):
+        definition = _PANDOC_STYLES.get(style_id.decode())
+        if definition is None:
+            continue
+        if style_id == b"Table" and b"TableGrid" not in defined:
+            definition = definition.replace("TableGrid", "TableNormal")
+        additions.append(definition.encode("utf-8"))
+        defined.add(style_id)
+    # FirstParagraph/Compact build on BodyText
+    if additions and b"BodyText" not in defined:
+        additions.insert(0, _PANDOC_STYLES["BodyText"].encode("utf-8"))
+    return styles_xml.replace(b"</w:styles>", b"".join(additions) + b"</w:styles>")
+
+
+def postprocess_docx(docx_path: Path, core_title: str | None):
+    """Patch the generated .docx: fill in missing styles, set the core title."""
+    with zipfile.ZipFile(docx_path) as zin:
+        items = [(info, zin.read(info.filename)) for info in zin.infolist()]
+    parts = {info.filename: data for info, data in items}
+    with zipfile.ZipFile(docx_path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for info, data in items:
+            if info.filename == "word/styles.xml":
+                data = _add_missing_styles(data, parts["word/document.xml"])
+            elif info.filename == "docProps/core.xml" and core_title:
+                # Word title fields/content controls read dc:title
+                data = re.sub(
+                    rb"<dc:title>.*?</dc:title>|<dc:title/>",
+                    b"<dc:title>" + escape(core_title).encode("utf-8") + b"</dc:title>",
+                    data, count=1, flags=re.DOTALL,
+                )
+            zout.writestr(info, data)
+
+
 def convert(
     input_path: Path,
     output_path: Path,
@@ -166,6 +275,10 @@ def convert(
         print(f"Processing {input_path.name}...")
         processed_md = process_markdown(md_text, work_dir, tools)
 
+        # Place the TOC at a [TOC] line if present, else pandoc puts it first
+        has_toc_placeholder = bool(TOC_PLACEHOLDER.search(processed_md))
+        processed_md = TOC_PLACEHOLDER.sub(lambda _: TOC_OPENXML, processed_md)
+
         # Write processed markdown
         processed_path = work_dir / "processed.md"
         processed_path.write_text(processed_md, encoding="utf-8")
@@ -177,10 +290,22 @@ def convert(
             "-o", str(output_path),
             "--from", "markdown",
             "--to", "docx",
-            "--toc",                    # table of contents
-            "--toc-depth=3",
-            "--resource-path", str(work_dir),
+            # Relative image paths resolve against the input file's folder
+            "--resource-path", os.pathsep.join([str(input_path.parent.resolve()), str(work_dir)]),
         ]
+
+        if not has_toc_placeholder:
+            cmd += ["--toc", "--toc-depth=3"]
+
+        # title-block: false -> body supplies its own cover page; keep the
+        # title only as a document property (used by template headers)
+        meta = read_metadata(processed_path, tools)
+        core_title = None
+        if meta.get("title-block") == {"t": "MetaBool", "c": False}:
+            core_title = stringify(meta.get("title"))
+            for key in ("title", "subtitle", "author", "date"):
+                if key in meta:
+                    cmd += ["--metadata", f"{key}="]
 
         if template_path:
             cmd += ["--reference-doc", str(template_path)]
@@ -190,6 +315,8 @@ def convert(
         if result.returncode != 0:
             print(f"pandoc error: {result.stderr}", file=sys.stderr)
             sys.exit(1)
+
+        postprocess_docx(output_path, core_title)
 
         print(f"Done → {output_path}")
 

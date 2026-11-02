@@ -1,6 +1,9 @@
-# No third-party Python packages are required.
-# convert_to_docx.py uses only the Python standard library.
+# convert_to_docx.py itself uses only the Python standard library.
 #
-# External CLI dependencies (install separately):
-# - pandoc
-# - @mermaid-js/mermaid-cli (mmdc)
+# Bundled pandoc binary (used when pandoc is not on PATH)
+pypandoc_binary
+# Installs Node.js into the venv for Mermaid CLI:
+#   nodeenv -p && npm install -g @mermaid-js/mermaid-cli
+nodeenv
+# Handy for inspecting .docx files (not needed for conversion)
+python-docx
